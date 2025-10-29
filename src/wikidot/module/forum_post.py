@@ -111,6 +111,8 @@ class ForumPost:
         投稿の編集日時（編集されていない場合はNone）
     _parent : ForumPost | None, default None
         親投稿（返信元の投稿）
+    _parent_id : int | None, default None
+        Parent post ID (the ID of the post being replied to)
     _source : str | None, default None
         投稿のソース（Wikidot記法）
     """
@@ -125,6 +127,7 @@ class ForumPost:
     edited_by: Optional["AbstractUser"] = None
     edited_at: Optional[datetime] = None
     _parent: Optional["ForumPost"] = None
+    _parent_id: Optional[int] = None
     _source: Optional[str] = None
 
     def __str__(self):
@@ -141,3 +144,50 @@ class ForumPost:
             f"text={self.text}, created_by={self.created_by}, created_at={self.created_at}, "
             f"edited_by={self.edited_by}, edited_at={self.edited_at})"
         )
+
+    @property
+    def parent(self) -> Optional["ForumPost"]:
+        """
+        Get the parent post (the post this one is replying to).
+
+        Returns:
+            ForumPost | None: The parent post object, or None if this post is not a reply.
+        """
+        if self._parent is None and self._parent_id is not None:
+            # Fetch the parent post directly by ID (efficient for large threads)
+            self._parent = self.thread.get_post_by_id(self._parent_id)
+        return self._parent
+
+    @parent.setter
+    def parent(self, value: Optional["ForumPost"]):
+        """
+        Set the parent post.
+
+        Args:
+            value: The parent post object to set.
+        """
+        self._parent = value
+        if value is not None:
+            self._parent_id = value.id
+
+    @property
+    def parent_id(self) -> Optional[int]:
+        """
+        Get the parent post ID.
+
+        Returns:
+            int | None: The parent post ID, or None if this post is not a reply.
+        """
+        return self._parent_id
+
+    @parent_id.setter
+    def parent_id(self, value: Optional[int]):
+        """
+        Set the parent post ID.
+
+        Args:
+            value: The parent post ID to set.
+        """
+        self._parent_id = value
+        # Clear cached parent post when ID changes
+        self._parent = None

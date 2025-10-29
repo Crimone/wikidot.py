@@ -19,6 +19,8 @@ from ..util.parser import user as user_parser
 
 if TYPE_CHECKING:
     from .forum_category import ForumCategory
+    from .forum_post import ForumPost, ForumPostCollection
+    from .page import Page
     from .site import Site
     from .user import AbstractUser
 
@@ -237,6 +239,21 @@ class ForumThreadCollection(list["ForumThread"]):
             raise NoElementException("Thread ID is not found in script.")
         thread_id = int(thread_id_match.group(1))
 
+        # Retrieve page_fullname
+        # Get related page from description-block
+        page_fullname = None
+        if description_block_elem is not None:
+            # Find all links that start with / but not forum/ or feed/
+            page_links = description_block_elem.select("a[href^='/']")
+            for page_link in page_links:
+                page_href = page_link.get("href", "")
+                # Remove leading slash
+                page_fullname_candidate = str(page_href).removeprefix("/")
+                # Only set if it's not a forum/feed/javascript link
+                if not page_fullname_candidate.startswith("forum") and not page_fullname_candidate.startswith("feed"):
+                    page_fullname = page_fullname_candidate
+                    break
+
         return ForumThread(
             site=site,
             id=thread_id,
@@ -246,6 +263,7 @@ class ForumThreadCollection(list["ForumThread"]):
             created_at=created_at,
             post_count=post_count,
             category=category,
+            page_fullname=page_fullname,
         )
 
     @staticmethod
@@ -388,6 +406,10 @@ class ForumThread:
         スレッド内の投稿数
     category : ForumCategory | None, default None
         スレッドが属するフォーラムカテゴリ
+    page_fullname : str | None, default None
+        Full name of the page associated with this thread
+    _page : Page | None, default None
+        Page object associated with this thread (lazy loaded)
     """
 
     site: "Site"
@@ -398,6 +420,8 @@ class ForumThread:
     created_at: datetime
     post_count: int
     category: Optional["ForumCategory"] = None
+    page_fullname: Optional[str] = None
+    _page: Optional["Page"] = None
 
     def __str__(self):
         """
@@ -428,6 +452,35 @@ class ForumThread:
         """
         return f"{self.site.url}/forum/t-{self.id}/"
 
+    @property
+    def page(self) -> Optional["Page"]:
+        """
+        Get the page associated with this thread.
+
+        Returns:
+            Page | None: The associated page object, or None if no page is associated.
+        """
+        from .page import PageCollection, SearchPagesQuery
+
+        if self._page is None and self.page_fullname is not None:
+            # Fetch the page
+            pages = PageCollection.search_pages(self.site, SearchPagesQuery(fullname=self.page_fullname))
+            if len(pages) > 0:
+                self._page = pages[0]
+        return self._page
+
+    @page.setter
+    def page(self, value: Optional["Page"]):
+        """
+        Set the associated page.
+
+        Args:
+            value: The page object to set.
+        """
+        self._page = value
+        if value is not None:
+            self.page_fullname = value.fullname
+
     @staticmethod
     def get_from_id(site: "Site", thread_id: int, category: Optional["ForumCategory"] = None) -> "ForumThread":
         """
@@ -448,3 +501,271 @@ class ForumThread:
             取得したスレッド情報
         """
         return ForumThreadCollection.acquire_from_thread_ids(site, [thread_id], category)[0]
+
+    def get_posts(self, page: int = 1) -> "ForumPostCollection":
+        """
+        Get posts from this thread.
+
+        Args:
+            page: Page number (1-indexed). Defaults to 1.
+
+        Returns:
+            ForumPostCollection: Collection of forum posts.
+
+        Raises:
+            NoElementException: If required elements are not found in response.
+        """
+        from .forum_post import ForumPost, ForumPostCollection
+
+        response = self.site.amc_request(
+            [
+                {
+                    "t": self.id,
+                    "pageNo": page,
+                    "moduleName": "forum/ForumViewThreadModule",
+                }
+            ]
+        )[0]
+
+        body = response.json()["body"]
+        html = BeautifulSoup(body, "lxml")
+
+        posts = []
+        for post_elem in html.select("div.post"):
+            post_id_elem = post_elem.get("id")
+            if post_id_elem is None:
+                continue
+
+            post_id_str = str(post_id_elem).removeprefix("post-")
+            if not post_id_str.isdigit():
+                continue
+            post_id = int(post_id_str)
+
+            # Find the parent post-container
+            post_container = post_elem.parent
+
+            # Get title
+            title_elem = post_container.select_one("div.title")
+            title = title_elem.text.strip() if title_elem else ""
+
+            # Get text
+            text_elem = post_container.select_one("div.content")
+            text = str(text_elem) if text_elem else ""
+
+            # Get created_by
+            user_elem = post_container.select_one("div.info span.printuser")
+            if user_elem is None:
+                raise NoElementException("User element is not found.")
+            created_by = user_parser(self.site.client, user_elem)
+
+            # Get created_at
+            odate_elem = post_container.select_one("div.info span.odate")
+            if odate_elem is None:
+                raise NoElementException("Odate element is not found.")
+            created_at = odate_parser(odate_elem)
+
+            # Get edited info if exists
+            edited_by = None
+            edited_at = None
+            edit_info_elem = post_container.select_one("div.changes")
+            if edit_info_elem:
+                edited_user_elem = edit_info_elem.select_one("span.printuser")
+                edited_odate_elem = edit_info_elem.select_one("span.odate")
+                if edited_user_elem and edited_odate_elem:
+                    edited_by = user_parser(self.site.client, edited_user_elem)
+                    edited_at = odate_parser(edited_odate_elem)
+
+            # Get parent post ID if exists
+            # Check if this post-container is nested inside another post-container
+            parent_post_id = None
+            if post_container is not None:
+                # Find parent post-container by looking for ancestor with class post-container
+                parent_container = post_container.find_parent("div", class_="post-container")
+                if parent_container is not None:
+                    parent_container_id = parent_container.get("id")
+                    if parent_container_id:
+                        # Extract parent post ID from fpc-XXXXXX format
+                        parent_id_str = str(parent_container_id).removeprefix("fpc-")
+                        if parent_id_str.isdigit():
+                            parent_post_id = int(parent_id_str)
+
+            post = ForumPost(
+                thread=self,
+                id=post_id,
+                title=title,
+                text=text,
+                element=post_elem,
+                created_by=created_by,
+                created_at=created_at,
+                edited_by=edited_by,
+                edited_at=edited_at,
+                _parent_id=parent_post_id,
+            )
+
+            posts.append(post)
+
+        return ForumPostCollection(thread=self, posts=posts)
+
+    def get_all_posts(self) -> "ForumPostCollection":
+        """
+        Get all posts from this thread across all pages.
+
+        Returns:
+            ForumPostCollection: Collection of all forum posts in this thread.
+
+        Raises:
+            NoElementException: If required elements are not found in response.
+        """
+        from .forum_post import ForumPostCollection
+
+        # Get first page to determine total pages
+        first_page_posts = self.get_posts(page=1)
+
+        # Get total pages from pager
+        response = self.site.amc_request(
+            [
+                {
+                    "t": self.id,
+                    "pageNo": 1,
+                    "moduleName": "forum/ForumViewThreadModule",
+                }
+            ]
+        )[0]
+
+        body = response.json()["body"]
+        html = BeautifulSoup(body, "lxml")
+
+        all_posts = list(first_page_posts)
+
+        # Check for pager
+        pager = html.select_one("div.pager")
+        if pager is not None:
+            # Get last page number
+            pager_links = pager.select("a")
+            if len(pager_links) >= 2:
+                last_page_link = pager_links[-2]
+                last_page = int(last_page_link.text.strip())
+
+                # Get remaining pages
+                for page_num in range(2, last_page + 1):
+                    page_posts = self.get_posts(page=page_num)
+                    all_posts.extend(page_posts)
+
+        return ForumPostCollection(thread=self, posts=all_posts)
+
+    def get_post_by_id(self, post_id: int) -> Optional["ForumPost"]:
+        """
+        Get a specific post by its ID directly using ForumViewThreadPostsModule.
+
+        This method uses Wikidot's API to fetch a specific post without loading
+        all posts, making it very efficient for large threads.
+
+        Args:
+            post_id: The ID of the post to retrieve.
+
+        Returns:
+            ForumPost | None: The post object if found, None otherwise.
+
+        Raises:
+            NoElementException: If required elements are not found in response.
+        """
+        from .forum_post import ForumPost
+
+        try:
+            # Use ForumViewThreadPostsModule to get the post directly
+            response = self.site.amc_request(
+                [
+                    {
+                        "postId": post_id,
+                        "t": self.id,
+                        "order": "",
+                        "moduleName": "forum/ForumViewThreadPostsModule",
+                    }
+                ]
+            )[0]
+
+            body = response.json()["body"]
+            html = BeautifulSoup(body, "lxml")
+
+            # Parse posts from the response
+            posts = []
+            for post_elem in html.select("div.post"):
+                post_id_elem = post_elem.get("id")
+                if post_id_elem is None:
+                    continue
+
+                parsed_post_id_str = str(post_id_elem).removeprefix("post-")
+                if not parsed_post_id_str.isdigit():
+                    continue
+                parsed_post_id = int(parsed_post_id_str)
+
+                # Find the parent post-container
+                post_container = post_elem.parent
+
+                # Get title
+                title_elem = post_container.select_one("div.title")
+                title = title_elem.text.strip() if title_elem else ""
+
+                # Get text
+                text_elem = post_container.select_one("div.content")
+                text = str(text_elem) if text_elem else ""
+
+                # Get created_by
+                user_elem = post_container.select_one("div.info span.printuser")
+                if user_elem is None:
+                    raise NoElementException("User element is not found.")
+                created_by = user_parser(self.site.client, user_elem)
+
+                # Get created_at
+                odate_elem = post_container.select_one("div.info span.odate")
+                if odate_elem is None:
+                    raise NoElementException("Odate element is not found.")
+                created_at = odate_parser(odate_elem)
+
+                # Get edited info if exists
+                edited_by = None
+                edited_at = None
+                edit_info_elem = post_container.select_one("div.changes")
+                if edit_info_elem:
+                    edited_user_elem = edit_info_elem.select_one("span.printuser")
+                    edited_odate_elem = edit_info_elem.select_one("span.odate")
+                    if edited_user_elem and edited_odate_elem:
+                        edited_by = user_parser(self.site.client, edited_user_elem)
+                        edited_at = odate_parser(edited_odate_elem)
+
+                # Get parent post ID if exists
+                parent_post_id_val = None
+                if post_container is not None:
+                    parent_container = post_container.find_parent("div", class_="post-container")
+                    if parent_container is not None:
+                        parent_container_id = parent_container.get("id")
+                        if parent_container_id:
+                            parent_id_str = str(parent_container_id).removeprefix("fpc-")
+                            if parent_id_str.isdigit():
+                                parent_post_id_val = int(parent_id_str)
+
+                post = ForumPost(
+                    thread=self,
+                    id=parsed_post_id,
+                    title=title,
+                    text=text,
+                    element=post_elem,
+                    created_by=created_by,
+                    created_at=created_at,
+                    edited_by=edited_by,
+                    edited_at=edited_at,
+                    _parent_id=parent_post_id_val,
+                )
+
+                posts.append(post)
+
+            # Find and return the requested post
+            for post in posts:
+                if post.id == post_id:
+                    return post
+
+            return None
+
+        except Exception:
+            # Fallback to searching through pages if the module doesn't work
+            return None
