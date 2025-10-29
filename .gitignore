@@ -162,3 +162,7 @@ cython_debug/
 
 /test.py
 workbench
+
+#Ignore cursor AI rules
+.cursor/
+.vscode/
